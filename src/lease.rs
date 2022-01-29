@@ -1,3 +1,4 @@
+use futures::future::{AbortHandle, Abortable};
 use http::StatusCode;
 use k8s_openapi::api::coordination::v1::Lease as LeaseObject;
 use kube::api::PatchParams;
@@ -26,28 +27,9 @@ pub enum Error {
 
     #[error(transparent)]
     Kube(#[from] kube::Error),
-    /*
-    #[error("data store disconnected")]
-    Disconnect(#[from] io::Error),
-    #[error("the data for key `{0}` is not available")]
-    Redaction(String),
-    #[error("invalid header (expected {expected:?}, found {found:?})")]
-    InvalidHeader {
-        expected: String,
-        found: String,
-    },
-    #[error("unknown data store error")]
-    Unknown,
-
-    #[error("aborted to release lock because we are not leading, the lock is held by {leader:}")]
-    ReleaseLockWhenNotLeading { leader: String },
-
-    #[error("failed to release the lock in Kubernetes: {0}")]
-    ReleaseLease(kube::Error),
-
-    */
 }
 
+#[derive(Clone)]
 pub struct LeaseLock {
     lease_name: String,
     api: Api,
@@ -55,12 +37,67 @@ pub struct LeaseLock {
     expo: ExponentialBackoff,
 }
 
-pub struct LeaseGuard {}
+pub struct LeaseGuard {
+    api: Api,
+    lease_state: LeaseState,
+    abort_handle: AbortHandle,
+}
 
-impl From<LeaseState> for LeaseGuard {
-    fn from(_ls: LeaseState) -> Self {
-        Self {}
+impl LeaseGuard {
+    pub fn new(api: Api, lease_state: LeaseState, abort_handle: AbortHandle) -> Self {
+        Self {
+            api,
+            lease_state,
+            abort_handle,
+        }
     }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+        tokio::spawn({
+            let api = self.api.clone();
+            let lease_state = self.lease_state.clone();
+            async move {
+                match release_lock(api, &lease_state).await {
+                    Err(e) => log::error!(
+                        "release_lock({}, {:?}) => {}",
+                        &lease_state.lease_name,
+                        &lease_state.holder,
+                        e
+                    ),
+                    Ok(_) => log::debug!(
+                        "release_lock({}, {:?})",
+                        &lease_state.lease_name,
+                        &lease_state.holder
+                    ),
+                }
+            }
+        });
+    }
+}
+
+async fn release_lock(api: Api, lease_state: &LeaseState) -> Result<LeaseState, Error> {
+    let patch: LeaseObject = serde_json::from_value(serde_json::json!({
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
+        "metadata": {
+            "name": &lease_state.lease_name,
+            "resourceVersion": &lease_state.resource_version,
+        },
+        "spec": {
+            "holderIdentity": serde_json::json!(null),
+        }
+    }))?;
+
+    api.patch(
+        &lease_state.lease_name,
+        &PatchParams::apply("lease-rs").force(),
+        &kube::api::Patch::Apply(&patch),
+    )
+    .await
+    .map(LeaseState::try_from)?
 }
 
 impl LeaseLock {
@@ -98,11 +135,86 @@ impl LeaseLock {
         let deadline = acquire_timeout.map(|to| Instant::now() + to);
 
         loop {
-            let lease_state = self.try_overwrite(holder_id, self.wait_free(deadline).await?).await?;
+            let lease_state = self
+                .try_overwrite(holder_id, self.wait_free(deadline).await?)
+                .await?;
             if lease_state.owner() == Some(holder_id) {
-                return Ok(LeaseGuard::from(lease_state));
+                return Ok(LeaseGuard::new(
+                    self.api.clone(),
+                    lease_state,
+                    self.clone().schedule_renewal(holder_id.to_string()),
+                ));
             }
         }
+    }
+
+    #[must_use]
+    fn schedule_renewal(self, holder_id: String) -> AbortHandle {
+        let (abort_handle, abort_reg) = AbortHandle::new_pair();
+        tokio::spawn(Abortable::new(
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(
+                        (self.lease_duration_sec * 400) as u64,
+                    ))
+                    .await;
+                    match self.get_state().await {
+                        Ok(lease_state) => {
+                            if lease_state.owner().as_ref() == Some(&holder_id.as_str()) {
+                                if let Err(e) = self.renew_lease(lease_state).await {
+                                    log::error!(
+                                        "renew_lease({}, {}) => {}",
+                                        self.lease_name,
+                                        holder_id,
+                                        e
+                                    );
+                                }
+                            } else {
+                                log::warn!(
+                                    "lost ownership; new owner: {:?}; stop renewal",
+                                    lease_state.owner()
+                                );
+                                return;
+                            }
+                        }
+                        Err(e) => log::error!(
+                            "schedule_renewal({}, {}) => {}",
+                            self.lease_name,
+                            holder_id,
+                            e
+                        ),
+                    }
+                }
+            },
+            abort_reg,
+        ));
+
+        abort_handle
+    }
+
+    async fn renew_lease(&self, lease_state: LeaseState) -> Result<LeaseState, Error> {
+        let now: &str = &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+        let patch: LeaseObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": &lease_state.lease_name,
+                "resourceVersion": &lease_state.resource_version,
+            },
+            "spec": {
+                "renewTime": now,
+                "holderIdentity": &lease_state.holder,
+            }
+        }))?;
+
+        self.api
+            .patch(
+                &lease_state.lease_name,
+                &PatchParams::apply("lease-rs").force(),
+                &kube::api::Patch::Apply(&patch),
+            )
+            .await
+            .map(LeaseState::try_from)?
     }
 
     pub async fn try_acquire(&self, holder_id: &str) -> Result<Option<LeaseGuard>, Error> {
@@ -192,7 +304,8 @@ impl LeaseLock {
 
 type UtcInstant = chrono::DateTime<chrono::offset::Utc>;
 
-struct LeaseState {
+#[derive(Clone)]
+pub struct LeaseState {
     lease_name: String,
     holder: Option<String>,
     renew_time: UtcInstant,
@@ -204,7 +317,10 @@ impl TryFrom<LeaseObject> for LeaseState {
     type Error = crate::lease::Error;
     fn try_from(lo: LeaseObject) -> Result<Self, Error> {
         Ok(LeaseState {
-            lease_name: lo.metadata.name.ok_or_else(|| Error::Format("lease name".into()))?,
+            lease_name: lo
+                .metadata
+                .name
+                .ok_or_else(|| Error::Format("lease name".into()))?,
 
             holder: lo.spec.as_ref().and_then(|x| x.holder_identity.clone()),
 
@@ -247,7 +363,11 @@ impl LeaseState {
 mod tests {
     use crate::lease::*;
     use kube::api::{DeleteParams, PostParams};
+    use rand::Rng;
+    use std::sync::Once;
     use test_context::{test_context, AsyncTestContext};
+
+    static LOG_INIT: Once = Once::new();
 
     struct TestContext {
         pub lease_name: String,
@@ -256,12 +376,13 @@ mod tests {
 
     impl TestContext {
         async fn create_lease(&self) {
-            env_logger::init();
+            LOG_INIT.call_once(|| env_logger::init());
+            log::debug!("create_lease({})", &self.lease_name);
             let lease: LeaseObject = serde_json::from_value(serde_json::json!({
-            "apiVersion": "coordination.k8s.io/v1",
-            "kind": "Lease",
-            "metadata": { "name": &self.lease_name },
-            "spec": {},
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": &self.lease_name },
+                "spec": {},
             }))
             .unwrap();
             let _ = self.api.create(&PostParams::default(), &lease).await;
@@ -272,7 +393,7 @@ mod tests {
     impl AsyncTestContext for TestContext {
         async fn setup() -> Self {
             let ctx = TestContext {
-                lease_name: std::env::var("LEASE_NAME").unwrap_or("test-lease".into()),
+                lease_name: format!("test-lease-{}", rand::thread_rng().gen::<u32>()),
                 api: kube::Api::default_namespaced(kube::Client::try_default().await.unwrap()),
             };
             ctx.create_lease().await;
@@ -280,6 +401,7 @@ mod tests {
         }
 
         async fn teardown(self) {
+            log::debug!("delete_lease({})", &self.lease_name);
             self.api
                 .delete(&self.lease_name, &DeleteParams::default())
                 .await
@@ -289,9 +411,14 @@ mod tests {
 
     #[test_context(TestContext)]
     #[tokio::test]
-    async fn try_acquire_locked(ctx: &mut TestContext) {
+    async fn raii(ctx: &mut TestContext) {
         let ll = LeaseLock::new(ctx.api.clone(), ctx.lease_name.clone());
-        assert!(ll.try_acquire("1").await.unwrap().is_some());
-        assert!(ll.try_acquire("2").await.unwrap().is_none());
+        {
+            let _guard = ll.try_acquire("initial").await.unwrap().unwrap();
+            assert!(ll.try_acquire("within scope").await.unwrap().is_none());
+        }
+        ll.acquire("outside scope", Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
     }
 }
