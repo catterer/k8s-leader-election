@@ -40,15 +40,15 @@ struct LeaseLockClient {
 
 pub struct LeaseLock {
     client: LeaseLockClient,
-    shutdown_sender: Option<Sender<()>>,
-    shutdown_receiver: Option<Receiver<()>>,
+    completion_tx: Sender<()>,
+    completion_rx: Receiver<()>,
 }
 
 pub struct LeaseGuard {
     api: Api,
     lease_state: LeaseState,
     abort_handle: AbortHandle,
-    shutdown_sender: Option<Sender<()>>,
+    completion_tx: Sender<()>,
 }
 
 impl Drop for LeaseGuard {
@@ -58,7 +58,7 @@ impl Drop for LeaseGuard {
         tokio::spawn({
             let api = self.api.clone();
             let lease_state = self.lease_state.clone();
-            let shutdown_sender = self.shutdown_sender.clone();
+            let completion_tx = self.completion_tx.clone();
             async move {
                 match release_lock(api, &lease_state).await {
                     Err(e) => log::error!(
@@ -73,7 +73,7 @@ impl Drop for LeaseGuard {
                         &lease_state.holder
                     ),
                 }
-                drop(shutdown_sender);
+                drop(completion_tx);
             }
         });
     }
@@ -103,7 +103,7 @@ async fn release_lock(api: Api, lease_state: &LeaseState) -> Result<LeaseState, 
 
 impl LeaseLock {
     pub fn new(api: Api, lease_name: String) -> Self {
-        let (shutdown_sender, shutdown_receiver) = channel(1);
+        let (completion_tx, completion_rx) = channel(1);
         Self {
             client: LeaseLockClient{
                 api,
@@ -111,8 +111,8 @@ impl LeaseLock {
                 lease_duration_sec: 10,
                 expo: ExponentialBackoff::from_millis(10).max_delay(Duration::from_secs(1)),
             },
-            shutdown_sender: Some(shutdown_sender),
-            shutdown_receiver: Some(shutdown_receiver),
+            completion_tx: completion_tx,
+            completion_rx: completion_rx,
         }
     }
 
@@ -126,10 +126,11 @@ impl LeaseLock {
         self
     }
 
-    pub async fn graceful_shutdown(&mut self) {
-        self.shutdown_sender = None;
-        let _ =  self.shutdown_receiver.as_mut().expect("graceful_shutdown called twice").recv().await;
-        self.shutdown_receiver = None;
+    pub async fn complete_all_operations(&mut self) {
+        let (completion_tx, completion_rx) = channel(1);
+        self.completion_tx = completion_tx;
+        let _ =  self.completion_rx.recv().await;
+        self.completion_rx = completion_rx;
     }
 
     pub async fn acquire(
@@ -137,7 +138,7 @@ impl LeaseLock {
         holder_id: &str,
         acquire_timeout: Option<Duration>,
     ) -> Result<LeaseGuard, Error> {
-        self.client.acquire(holder_id, acquire_timeout, self.shutdown_sender.clone()).await
+        self.client.acquire(holder_id, acquire_timeout, self.completion_tx.clone()).await
     }
 
     pub async fn try_acquire(&self, holder_id: &str) -> Result<Option<LeaseGuard>, Error> {
@@ -156,7 +157,7 @@ impl LeaseLockClient {
         &self,
         holder_id: &str,
         acquire_timeout: Option<Duration>,
-        shutdown_sender: Option<Sender<()>>,
+        completion_tx: Sender<()>,
     ) -> Result<LeaseGuard, Error> {
         log::debug!(
             "{}.acquire({}, {:?})",
@@ -176,7 +177,7 @@ impl LeaseLockClient {
                     api: self.api.clone(),
                     lease_state,
                     abort_handle: self.clone().schedule_renewal(holder_id.to_string()),
-                    shutdown_sender,
+                    completion_tx,
                 });
             }
         }
@@ -424,7 +425,7 @@ mod tests {
 
         async fn teardown(mut self) {
             log::debug!("{}.teardown()", &self.lease_name);
-            self.lease_lock.graceful_shutdown().await;
+            self.lease_lock.complete_all_operations().await;
             self.api
                 .delete(&self.lease_name, &DeleteParams::default())
                 .await
@@ -462,4 +463,17 @@ mod tests {
             .collect::<futures::stream::FuturesUnordered<_>>()
             .collect::<Vec<_>>().await;
     }
+
+    #[test_context(TestContext)]
+    #[tokio::test]
+    async fn complete(ctx: &mut TestContext) {
+        {
+            let _ = ctx.lease_lock.try_acquire("1").await.unwrap().unwrap();
+        }
+        ctx.lease_lock.complete_all_operations().await;
+        {
+            let _ = ctx.lease_lock.try_acquire("1").await.unwrap().unwrap();
+        }
+    }
+
 }
