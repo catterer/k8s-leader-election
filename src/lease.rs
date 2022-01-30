@@ -4,8 +4,8 @@ use k8s_openapi::api::coordination::v1::Lease as LeaseObject;
 use kube::api::PatchParams;
 use std::convert::TryFrom;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_retry::strategy::ExponentialBackoff;
-use tokio::sync::mpsc::{channel, Sender, Receiver};
 
 type Api = kube::Api<LeaseObject>;
 
@@ -53,7 +53,11 @@ pub struct LeaseGuard {
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        log::debug!("{}.drop({:?})", &self.lease_state.lease_name, &self.lease_state.holder);
+        log::debug!(
+            "{}.drop({:?})",
+            &self.lease_state.lease_name,
+            &self.lease_state.holder
+        );
         self.abort_handle.abort();
         tokio::spawn({
             let api = self.api.clone();
@@ -105,7 +109,7 @@ impl LeaseLock {
     pub fn new(api: Api, lease_name: String) -> Self {
         let (completion_tx, completion_rx) = channel(1);
         Self {
-            client: LeaseLockClient{
+            client: LeaseLockClient {
                 api,
                 lease_name,
                 lease_duration_sec: 10,
@@ -129,7 +133,7 @@ impl LeaseLock {
     pub async fn complete_all_operations(&mut self) {
         let (completion_tx, completion_rx) = channel(1);
         self.completion_tx = completion_tx;
-        let _ =  self.completion_rx.recv().await;
+        let _ = self.completion_rx.recv().await;
         self.completion_rx = completion_rx;
     }
 
@@ -138,7 +142,9 @@ impl LeaseLock {
         holder_id: &str,
         acquire_timeout: Option<Duration>,
     ) -> Result<LeaseGuard, Error> {
-        self.client.acquire(holder_id, acquire_timeout, self.completion_tx.clone()).await
+        self.client
+            .acquire(holder_id, acquire_timeout, self.completion_tx.clone())
+            .await
     }
 
     pub async fn try_acquire(&self, holder_id: &str) -> Result<Option<LeaseGuard>, Error> {
@@ -173,7 +179,7 @@ impl LeaseLockClient {
                 .try_overwrite(holder_id, self.wait_free(deadline).await?)
                 .await?;
             if lease_state.owner() == Some(holder_id) {
-                return Ok(LeaseGuard{
+                return Ok(LeaseGuard {
                     api: self.api.clone(),
                     lease_state,
                     abort_handle: self.clone().schedule_renewal(holder_id.to_string()),
@@ -387,12 +393,12 @@ impl LeaseState {
 #[cfg(test)]
 mod tests {
     use crate::lease::*;
+    use futures::stream::StreamExt;
     use kube::api::{DeleteParams, PostParams};
     use rand::Rng;
     use std::sync::Once;
-    use test_context::{test_context, AsyncTestContext};
     use taken::take;
-    use futures::stream::StreamExt;
+    use test_context::{test_context, AsyncTestContext};
 
     static LOG_INIT: Once = Once::new();
 
@@ -420,7 +426,11 @@ mod tests {
             .unwrap();
             let _ = api.create(&PostParams::default(), &lease).await;
             let lease_lock = LeaseLock::new(api.clone(), lease_name.clone());
-            Self{lease_name, api, lease_lock}
+            Self {
+                lease_name,
+                api,
+                lease_lock,
+            }
         }
 
         async fn teardown(mut self) {
@@ -437,10 +447,21 @@ mod tests {
     #[tokio::test]
     async fn raii(ctx: &mut TestContext) {
         {
-            let _guard = ctx.lease_lock.try_acquire("initial").await.unwrap().unwrap();
-            assert!(ctx.lease_lock.try_acquire("within scope").await.unwrap().is_none());
+            let _guard = ctx
+                .lease_lock
+                .try_acquire("initial")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(ctx
+                .lease_lock
+                .try_acquire("within scope")
+                .await
+                .unwrap()
+                .is_none());
         }
-        ctx.lease_lock.acquire("outside scope", Some(Duration::from_secs(1)))
+        ctx.lease_lock
+            .acquire("outside scope", Some(Duration::from_secs(1)))
             .await
             .unwrap();
     }
@@ -454,14 +475,18 @@ mod tests {
         take!(&glob, &ctx);
         (1..10)
             .map(|i| async move {
-                let _guard = ctx.lease_lock
-                    .acquire(&format!("{}", i), Some(Duration::from_secs(5))).await.unwrap();
+                let _guard = ctx
+                    .lease_lock
+                    .acquire(&format!("{}", i), Some(Duration::from_secs(5)))
+                    .await
+                    .unwrap();
                 *glob.lock().await = i;
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 assert_eq!(*glob.lock().await, i);
             })
             .collect::<futures::stream::FuturesUnordered<_>>()
-            .collect::<Vec<_>>().await;
+            .collect::<Vec<_>>()
+            .await;
     }
 
     #[test_context(TestContext)]
@@ -475,5 +500,4 @@ mod tests {
             let _ = ctx.lease_lock.try_acquire("1").await.unwrap().unwrap();
         }
     }
-
 }
