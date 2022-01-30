@@ -5,6 +5,7 @@ use kube::api::PatchParams;
 use std::convert::TryFrom;
 use std::time::{Duration, Instant};
 use tokio_retry::strategy::ExponentialBackoff;
+use tokio::sync::mpsc::{channel, Sender, Receiver};
 
 type Api = kube::Api<LeaseObject>;
 
@@ -30,49 +31,49 @@ pub enum Error {
 }
 
 #[derive(Clone)]
-pub struct LeaseLock {
+struct LeaseLockClient {
     lease_name: String,
     api: Api,
     lease_duration_sec: i32,
     expo: ExponentialBackoff,
 }
 
+pub struct LeaseLock {
+    client: LeaseLockClient,
+    shutdown_sender: Option<Sender<()>>,
+    shutdown_receiver: Option<Receiver<()>>,
+}
+
 pub struct LeaseGuard {
     api: Api,
     lease_state: LeaseState,
     abort_handle: AbortHandle,
-}
-
-impl LeaseGuard {
-    pub fn new(api: Api, lease_state: LeaseState, abort_handle: AbortHandle) -> Self {
-        Self {
-            api,
-            lease_state,
-            abort_handle,
-        }
-    }
+    shutdown_sender: Option<Sender<()>>,
 }
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
+        log::debug!("{}.drop({:?})", &self.lease_state.lease_name, &self.lease_state.holder);
         self.abort_handle.abort();
         tokio::spawn({
             let api = self.api.clone();
             let lease_state = self.lease_state.clone();
+            let shutdown_sender = self.shutdown_sender.clone();
             async move {
                 match release_lock(api, &lease_state).await {
                     Err(e) => log::error!(
-                        "release_lock({}, {:?}) => {}",
+                        "{}.release_lock({:?}) => {}",
                         &lease_state.lease_name,
                         &lease_state.holder,
                         e
                     ),
                     Ok(_) => log::debug!(
-                        "release_lock({}, {:?})",
+                        "release_lock({}, {:?}) => OK",
                         &lease_state.lease_name,
                         &lease_state.holder
                     ),
                 }
+                drop(shutdown_sender);
             }
         });
     }
@@ -102,28 +103,60 @@ async fn release_lock(api: Api, lease_state: &LeaseState) -> Result<LeaseState, 
 
 impl LeaseLock {
     pub fn new(api: Api, lease_name: String) -> Self {
+        let (shutdown_sender, shutdown_receiver) = channel(1);
         Self {
-            api,
-            lease_name,
-            lease_duration_sec: 10,
-            expo: ExponentialBackoff::from_millis(10).max_delay(Duration::from_secs(1)),
+            client: LeaseLockClient{
+                api,
+                lease_name,
+                lease_duration_sec: 10,
+                expo: ExponentialBackoff::from_millis(10).max_delay(Duration::from_secs(1)),
+            },
+            shutdown_sender: Some(shutdown_sender),
+            shutdown_receiver: Some(shutdown_receiver),
         }
     }
 
     pub fn with_lease_duration_sec(mut self, sec: i32) -> Self {
-        self.lease_duration_sec = sec;
+        self.client.lease_duration_sec = sec;
         self
     }
 
     pub fn with_expo_backoff(mut self, expo: ExponentialBackoff) -> Self {
-        self.expo = expo;
+        self.client.expo = expo;
         self
+    }
+
+    pub async fn graceful_shutdown(&mut self) {
+        self.shutdown_sender = None;
+        let _ =  self.shutdown_receiver.as_mut().expect("graceful_shutdown called twice").recv().await;
+        self.shutdown_receiver = None;
     }
 
     pub async fn acquire(
         &self,
         holder_id: &str,
         acquire_timeout: Option<Duration>,
+    ) -> Result<LeaseGuard, Error> {
+        self.client.acquire(holder_id, acquire_timeout, self.shutdown_sender.clone()).await
+    }
+
+    pub async fn try_acquire(&self, holder_id: &str) -> Result<Option<LeaseGuard>, Error> {
+        match self.acquire(holder_id, Some(Duration::ZERO)).await {
+            Ok(lg) => Ok(Some(lg)),
+            Err(e) => match e {
+                Error::AcquireTimeout => Ok(None),
+                _ => Err(e),
+            },
+        }
+    }
+}
+
+impl LeaseLockClient {
+    pub async fn acquire(
+        &self,
+        holder_id: &str,
+        acquire_timeout: Option<Duration>,
+        shutdown_sender: Option<Sender<()>>,
     ) -> Result<LeaseGuard, Error> {
         log::debug!(
             "{}.acquire({}, {:?})",
@@ -139,11 +172,12 @@ impl LeaseLock {
                 .try_overwrite(holder_id, self.wait_free(deadline).await?)
                 .await?;
             if lease_state.owner() == Some(holder_id) {
-                return Ok(LeaseGuard::new(
-                    self.api.clone(),
+                return Ok(LeaseGuard{
+                    api: self.api.clone(),
                     lease_state,
-                    self.clone().schedule_renewal(holder_id.to_string()),
-                ));
+                    abort_handle: self.clone().schedule_renewal(holder_id.to_string()),
+                    shutdown_sender,
+                });
             }
         }
     }
@@ -215,16 +249,6 @@ impl LeaseLock {
             )
             .await
             .map(LeaseState::try_from)?
-    }
-
-    pub async fn try_acquire(&self, holder_id: &str) -> Result<Option<LeaseGuard>, Error> {
-        match self.acquire(holder_id, Some(Duration::ZERO)).await {
-            Ok(lg) => Ok(Some(lg)),
-            Err(e) => match e {
-                Error::AcquireTimeout => Ok(None),
-                _ => Err(e),
-            },
-        }
     }
 
     async fn get_state(&self) -> Result<LeaseState, Error> {
@@ -383,7 +407,7 @@ mod tests {
             LOG_INIT.call_once(|| env_logger::init());
 
             let lease_name = format!("test-lease-{}", rand::thread_rng().gen::<u32>());
-            log::debug!("setup({})", &lease_name);
+            log::debug!("{}.setup()", &lease_name);
 
             let api = kube::Api::default_namespaced(kube::Client::try_default().await.unwrap());
             let lease: LeaseObject = serde_json::from_value(serde_json::json!({
@@ -398,8 +422,9 @@ mod tests {
             Self{lease_name, api, lease_lock}
         }
 
-        async fn teardown(self) {
-            log::debug!("teardown({})", &self.lease_name);
+        async fn teardown(mut self) {
+            log::debug!("{}.teardown()", &self.lease_name);
+            self.lease_lock.graceful_shutdown().await;
             self.api
                 .delete(&self.lease_name, &DeleteParams::default())
                 .await
@@ -425,19 +450,16 @@ mod tests {
         use std::sync::Arc;
         use tokio::sync::Mutex;
         let glob = Arc::new(Mutex::new(0));
-        let mut futures = (1..50)
-            .map(|i| {
-                take!(&glob, &ctx);
-                async move {
-                    let _guard = ctx.lease_lock
-                        .acquire(&format!("{}", i), Some(Duration::from_secs(5))).await.unwrap();
-                    *glob.lock().await = i;
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    assert_eq!(*glob.lock().await, i);
-                }
+        take!(&glob, &ctx);
+        (1..10)
+            .map(|i| async move {
+                let _guard = ctx.lease_lock
+                    .acquire(&format!("{}", i), Some(Duration::from_secs(5))).await.unwrap();
+                *glob.lock().await = i;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                assert_eq!(*glob.lock().await, i);
             })
-            .collect::<futures::stream::FuturesUnordered<_>>();
-        for _ in futures.next().await {
-        }
+            .collect::<futures::stream::FuturesUnordered<_>>()
+            .collect::<Vec<_>>().await;
     }
 }
