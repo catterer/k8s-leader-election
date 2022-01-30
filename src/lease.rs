@@ -374,36 +374,32 @@ mod tests {
     struct TestContext {
         pub lease_name: String,
         pub api: Api,
-    }
-
-    impl TestContext {
-        async fn create_lease(&self) {
-            LOG_INIT.call_once(|| env_logger::init());
-            log::debug!("create_lease({})", &self.lease_name);
-            let lease: LeaseObject = serde_json::from_value(serde_json::json!({
-                "apiVersion": "coordination.k8s.io/v1",
-                "kind": "Lease",
-                "metadata": { "name": &self.lease_name },
-                "spec": {},
-            }))
-            .unwrap();
-            let _ = self.api.create(&PostParams::default(), &lease).await;
-        }
+        pub lease_lock: LeaseLock,
     }
 
     #[async_trait::async_trait]
     impl AsyncTestContext for TestContext {
         async fn setup() -> Self {
-            let ctx = TestContext {
-                lease_name: format!("test-lease-{}", rand::thread_rng().gen::<u32>()),
-                api: kube::Api::default_namespaced(kube::Client::try_default().await.unwrap()),
-            };
-            ctx.create_lease().await;
-            ctx
+            LOG_INIT.call_once(|| env_logger::init());
+
+            let lease_name = format!("test-lease-{}", rand::thread_rng().gen::<u32>());
+            log::debug!("setup({})", &lease_name);
+
+            let api = kube::Api::default_namespaced(kube::Client::try_default().await.unwrap());
+            let lease: LeaseObject = serde_json::from_value(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": &lease_name },
+                "spec": {},
+            }))
+            .unwrap();
+            let _ = api.create(&PostParams::default(), &lease).await;
+            let lease_lock = LeaseLock::new(api.clone(), lease_name.clone());
+            Self{lease_name, api, lease_lock}
         }
 
         async fn teardown(self) {
-            log::debug!("delete_lease({})", &self.lease_name);
+            log::debug!("teardown({})", &self.lease_name);
             self.api
                 .delete(&self.lease_name, &DeleteParams::default())
                 .await
@@ -414,12 +410,11 @@ mod tests {
     #[test_context(TestContext)]
     #[tokio::test]
     async fn raii(ctx: &mut TestContext) {
-        let ll = LeaseLock::new(ctx.api.clone(), ctx.lease_name.clone());
         {
-            let _guard = ll.try_acquire("initial").await.unwrap().unwrap();
-            assert!(ll.try_acquire("within scope").await.unwrap().is_none());
+            let _guard = ctx.lease_lock.try_acquire("initial").await.unwrap().unwrap();
+            assert!(ctx.lease_lock.try_acquire("within scope").await.unwrap().is_none());
         }
-        ll.acquire("outside scope", Some(Duration::from_secs(1)))
+        ctx.lease_lock.acquire("outside scope", Some(Duration::from_secs(1)))
             .await
             .unwrap();
     }
@@ -434,7 +429,7 @@ mod tests {
             .map(|i| {
                 take!(&glob, &ctx);
                 async move {
-                    let _guard = LeaseLock::new(ctx.api.clone(), ctx.lease_name.clone())
+                    let _guard = ctx.lease_lock
                         .acquire(&format!("{}", i), Some(Duration::from_secs(5))).await.unwrap();
                     *glob.lock().await = i;
                     tokio::time::sleep(Duration::from_millis(10)).await;
