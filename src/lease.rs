@@ -35,12 +35,16 @@ struct LeaseLockClient {
     expo: ExponentialBackoff,
 }
 
+/// Represents RAII lock based on k8s lease resource.
 pub struct LeaseLock {
     client: LeaseLockClient,
     completion_tx: Sender<()>,
     completion_rx: Receiver<()>,
 }
 
+/// RAII implementation of a 'scoped lock' of k8s lease.
+/// When dropped, schedules unlock task.
+/// To wait until unlocking is completed, see [LeaseLock::complete_all_operations].
 pub struct LeaseGuard {
     api: Api,
     lease_state: LeaseState,
@@ -117,16 +121,22 @@ impl LeaseLock {
         }
     }
 
+    /// Configure lease expiry time. Default is 10 seconds.
+    /// Only matters if normal unlocking (via [LeaseGuard]) did not happend for some reason.
     pub fn with_lease_duration_sec(mut self, sec: i32) -> Self {
         self.client.lease_duration_sec = sec;
         self
     }
 
+    /// Customize backoff policy. Default is
+    /// `ExponentialBackoff::from_millis(10).max_delay(Duration::from_secs(1))`
     pub fn with_expo_backoff(mut self, expo: ExponentialBackoff) -> Self {
         self.client.expo = expo;
         self
     }
 
+    /// Wait for all inflight operations on this lock to complete.
+    /// Can be used for graceful shutdown to make sure all scheduled unlocks complete.
     pub async fn complete_all_operations(&mut self) {
         let (completion_tx, completion_rx) = channel(1);
         self.completion_tx = completion_tx;
@@ -134,6 +144,14 @@ impl LeaseLock {
         self.completion_rx = completion_rx;
     }
 
+    /// Acquire the lock; return [LeaseGuard] RAII object. Lease renewal will be done in background
+    /// as long as [LeaseGuard] exists.
+    ///
+    /// # Arguments
+    ///
+    /// `holder_id` - represents holder of the lock.
+    /// `acquire_timeout` - return [Error::AcquireTimeout] error if acquire did not complete within the
+    /// timeout.
     pub async fn acquire(
         &self,
         holder_id: &str,
@@ -144,6 +162,7 @@ impl LeaseLock {
             .await
     }
 
+    /// Acquire the lock if it can be done immediately. If not, return None.
     pub async fn try_acquire(&self, holder_id: &str) -> Result<Option<LeaseGuard>, Error> {
         match self.acquire(holder_id, Some(Duration::ZERO)).await {
             Ok(lg) => Ok(Some(lg)),
@@ -173,9 +192,7 @@ impl LeaseLockClient {
 
         loop {
             let lease_state = self.wait_free(deadline, &holder_id).await?;
-            let lease_state = self
-                .try_overwrite(holder_id, lease_state)
-                .await?;
+            let lease_state = self.try_overwrite(holder_id, lease_state).await?;
             if lease_state.owner() == Some(holder_id) {
                 return Ok(LeaseGuard {
                     api: self.api.clone(),
@@ -263,7 +280,11 @@ impl LeaseLockClient {
             .map(LeaseState::try_from)?
     }
 
-    async fn wait_free(&self, deadline: Option<Instant>, holder: &str) -> Result<LeaseState, Error> {
+    async fn wait_free(
+        &self,
+        deadline: Option<Instant>,
+        holder: &str,
+    ) -> Result<LeaseState, Error> {
         let mut lease_state = self.get_state().await?;
         if lease_state.owner().is_none() {
             return Ok(lease_state);
@@ -276,7 +297,13 @@ impl LeaseLockClient {
                 }
             }
 
-            log::debug!("{}.wait_free({}) => {}:backoff({:?})!", &self.lease_name, holder, &lease_state.holder.unwrap(), backoff);
+            log::debug!(
+                "{}.wait_free({}) => {}:backoff({:?})!",
+                &self.lease_name,
+                holder,
+                &lease_state.holder.unwrap(),
+                backoff
+            );
             tokio::time::sleep(backoff).await;
 
             lease_state = self.get_state().await?;
@@ -322,7 +349,11 @@ impl LeaseLockClient {
             Err(e) => {
                 if let kube::Error::Api(api_err) = e {
                     if api_err.code == StatusCode::CONFLICT {
-                        log::debug!("{}.try_overwrite({}) => conflict", &self.lease_name, &holder_id);
+                        log::debug!(
+                            "{}.try_overwrite({}) => conflict",
+                            &self.lease_name,
+                            &holder_id
+                        );
                         return Ok(lease_state);
                     }
                     return Err(kube::Error::Api(api_err).into());
@@ -517,21 +548,30 @@ mod tests {
                 "holderIdentity": "to_expire",
                 "leaseDurationSeconds": 2,
             }
-        })).unwrap();
+        }))
+        .unwrap();
 
-        ctx
-            .api
+        ctx.api
             .patch(
                 &ctx.lease_lock.client.lease_name,
                 &PatchParams::apply("lease-rs").force(),
                 &kube::api::Patch::Apply(&patch),
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        assert!(ctx.lease_lock.try_acquire("before_expiration").await.unwrap().is_none());
+        assert!(ctx
+            .lease_lock
+            .try_acquire("before_expiration")
+            .await
+            .unwrap()
+            .is_none());
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(ctx.lease_lock.try_acquire("after_expiration").await.unwrap().is_some());
+        assert!(ctx
+            .lease_lock
+            .try_acquire("after_expiration")
+            .await
+            .unwrap()
+            .is_some());
     }
-
-
 }
