@@ -366,6 +366,8 @@ mod tests {
     use rand::Rng;
     use std::sync::Once;
     use test_context::{test_context, AsyncTestContext};
+    use taken::take;
+    use futures::stream::StreamExt;
 
     static LOG_INIT: Once = Once::new();
 
@@ -420,5 +422,27 @@ mod tests {
         ll.acquire("outside scope", Some(Duration::from_secs(1)))
             .await
             .unwrap();
+    }
+
+    #[test_context(TestContext)]
+    #[tokio::test]
+    async fn concurrent_locks(ctx: &mut TestContext) {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let glob = Arc::new(Mutex::new(0));
+        let mut futures = (1..50)
+            .map(|i| {
+                take!(&glob, &ctx);
+                async move {
+                    let _guard = LeaseLock::new(ctx.api.clone(), ctx.lease_name.clone())
+                        .acquire(&format!("{}", i), Some(Duration::from_secs(5))).await.unwrap();
+                    *glob.lock().await = i;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    assert_eq!(*glob.lock().await, i);
+                }
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>();
+        for _ in futures.next().await {
+        }
     }
 }
