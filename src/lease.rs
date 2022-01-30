@@ -14,9 +14,6 @@ pub enum Error {
     #[error("timeout waiting for acquire")]
     AcquireTimeout,
 
-    #[error("trying to lock recursively")]
-    RecursiveLockAttempt,
-
     #[error("Integer overflow in duration value")]
     IntOverflow(#[from] std::num::TryFromIntError),
 
@@ -175,8 +172,9 @@ impl LeaseLockClient {
         let deadline = acquire_timeout.map(|to| Instant::now() + to);
 
         loop {
+            let lease_state = self.wait_free(deadline, &holder_id).await?;
             let lease_state = self
-                .try_overwrite(holder_id, self.wait_free(deadline).await?)
+                .try_overwrite(holder_id, lease_state)
                 .await?;
             if lease_state.owner() == Some(holder_id) {
                 return Ok(LeaseGuard {
@@ -265,8 +263,8 @@ impl LeaseLockClient {
             .map(LeaseState::try_from)?
     }
 
-    async fn wait_free(&self, deadline: Option<Instant>) -> Result<LeaseState, Error> {
-        let lease_state = self.get_state().await?;
+    async fn wait_free(&self, deadline: Option<Instant>, holder: &str) -> Result<LeaseState, Error> {
+        let mut lease_state = self.get_state().await?;
         if lease_state.owner().is_none() {
             return Ok(lease_state);
         }
@@ -278,9 +276,10 @@ impl LeaseLockClient {
                 }
             }
 
+            log::debug!("{}.wait_free({}) => {}:backoff({:?})!", &self.lease_name, holder, &lease_state.holder.unwrap(), backoff);
             tokio::time::sleep(backoff).await;
 
-            let lease_state = self.get_state().await?;
+            lease_state = self.get_state().await?;
             if lease_state.owner().is_none() {
                 return Ok(lease_state);
             }
@@ -323,6 +322,7 @@ impl LeaseLockClient {
             Err(e) => {
                 if let kube::Error::Api(api_err) = e {
                     if api_err.code == StatusCode::CONFLICT {
+                        log::debug!("{}.try_overwrite({}) => conflict", &self.lease_name, &holder_id);
                         return Ok(lease_state);
                     }
                     return Err(kube::Error::Api(api_err).into());
@@ -473,11 +473,11 @@ mod tests {
         use tokio::sync::Mutex;
         let glob = Arc::new(Mutex::new(0));
         take!(&glob, &ctx);
-        (1..10)
+        (1..8)
             .map(|i| async move {
                 let _guard = ctx
                     .lease_lock
-                    .acquire(&format!("{}", i), Some(Duration::from_secs(5)))
+                    .acquire(&format!("{}", i), Some(Duration::from_secs(20)))
                     .await
                     .unwrap();
                 *glob.lock().await = i;
@@ -500,4 +500,38 @@ mod tests {
             let _ = ctx.lease_lock.try_acquire("1").await.unwrap().unwrap();
         }
     }
+
+    #[test_context(TestContext)]
+    #[tokio::test]
+    async fn expire(ctx: &mut TestContext) {
+        let now: &str = &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+        let patch: LeaseObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": &ctx.lease_lock.client.lease_name,
+            },
+            "spec": {
+                "acquireTime": now,
+                "renewTime": now,
+                "holderIdentity": "to_expire",
+                "leaseDurationSeconds": 2,
+            }
+        })).unwrap();
+
+        ctx
+            .api
+            .patch(
+                &ctx.lease_lock.client.lease_name,
+                &PatchParams::apply("lease-rs").force(),
+                &kube::api::Patch::Apply(&patch),
+            )
+            .await.unwrap();
+
+        assert!(ctx.lease_lock.try_acquire("before_expiration").await.unwrap().is_none());
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(ctx.lease_lock.try_acquire("after_expiration").await.unwrap().is_some());
+    }
+
+
 }
