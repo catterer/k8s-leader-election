@@ -22,5 +22,5 @@ let lock = LeaseLock::new(api, "my-lock");
     let _guard = lock.try_acquire("holder-1").await?.unwrap();
     // the lock is now acquired
 }
-// the lock is now begin released
+// the lock is now being released
 ```
