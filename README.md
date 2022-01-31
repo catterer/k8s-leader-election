@@ -23,4 +23,7 @@ let lock = LeaseLock::new(api, "my-lock");
     // the lock is now acquired
 }
 // the lock is now being released
+...
+// graceful shutdown, complete all pending requests (i.e., scheduled unlocks)
+lock.complete_all_operations().await;
 ```
