@@ -19,7 +19,7 @@ let api = kube::Api::default_namespaced(kube::Client::try_default().await.unwrap
 
 let lock = LeaseLock::new(api, "my-lock");
 {
-    let _guard = lock.try_acquire("holder-1").await?;
+    let _guard = lock.try_acquire("holder-1").await?.unwrap();
     // the lock is now acquired
 }
 // the lock is now begin released
